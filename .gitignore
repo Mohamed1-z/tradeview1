@@ -1,0 +1,5 @@
+.pytest_tmp/
+/.pytest_tmp*
+__pycache__/
+.pytest_cache/
+signals/
