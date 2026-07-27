@@ -76,7 +76,7 @@ import os
 import sys
 from pathlib import Path
 
-from swift_scanner.config import DEFAULT_TIMEFRAME_NAMES, ScannerConfig, TIMEFRAME_MAP, build_timeframes
+from swift_scanner.config import DEFAULT_TIMEFRAME_NAMES, ScannerConfig, TIMEFRAME_MAP, build_timeframes, ZoneGatingConfig
 from swift_scanner.config_validation import validate_config
 from swift_scanner.notifier import SignalNotifier
 from swift_scanner.reporting import analyze_alert_history
@@ -353,6 +353,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Require FVG confluence for premium zone entries (overrides default).",
     )
     parser.add_argument(
+        "--require-fvg-for-discount",
+        action="store_true",
+        help="Require FVG confluence for discount zone entries (overrides default).",
+    )
+    parser.add_argument(
+        "--require-fvg-for-fvg",
+        action="store_true",
+        help="Require FVG confluence for FVG signals (redundant but provided for symmetry).",
+    )
+    parser.add_argument(
+        "--zones",
+        nargs="+",
+        default=None,
+        help=(
+            "List of zone types to detect (space-separated). "
+            "Accepts: fvg, premium, discount, liquidity (or full names)."
+        ),
+    )
+    parser.add_argument(
         "--report-lookahead-bars",
         type=int,
         default=40,
@@ -410,11 +429,78 @@ def build_config_from_args(args) -> ScannerConfig:
         use_trend_filter=args.trend_filter,
     )
 
-    # Optional CLI override: require FVG for premium zone
+    # Optional CLI: select specific zone types from the command line
+    if getattr(args, "zones", None) is not None:
+        raw_parts = [p.strip().lower() for p in args.zones if p and p.strip()]
+        aliases = {
+            "fvg": "fair_value_gap",
+            "fairvaluegap": "fair_value_gap",
+            "fair_value_gap": "fair_value_gap",
+            "fair_value_gap": "fair_value_gap",
+            "liquidity": "liquidity_sweep",
+            "sweep": "liquidity_sweep",
+            "liquiditysweep": "liquidity_sweep",
+            "liquidity_sweep": "liquidity_sweep",
+            "premium": "premium_zone",
+            "premiumzone": "premium_zone",
+            "premium_zone": "premium_zone",
+            "discount": "discount_zone",
+            "discountzone": "discount_zone",
+            "discount_zone": "discount_zone",
+        }
+        selected: list[str] = []
+        for part in raw_parts:
+            key = aliases.get(part) or aliases.get(part.replace("_", ""))
+            if key is None:
+                # allow full canonical names
+                if part in config.zone_gating:
+                    key = part
+            if key and key not in selected:
+                selected.append(key)
+
+        # Apply selections: only zone types are applied here (do not toggle SWIFT)
+        selected_zones = selected
+        config.selected_zone_types = selected_zones
+        config.enable_zone_trading = bool(selected_zones)
+
+    # Optional CLI overrides: require FVG for specific zones
     try:
-        if getattr(args, "require_fvg_for_premium", False):
-            if "premium_zone" in config.zone_gating:
-                config.zone_gating["premium_zone"].require_fvg_confluence = True
+        if getattr(args, "require_fvg_for_premium", False) and "premium_zone" in config.zone_gating:
+            old = config.zone_gating["premium_zone"]
+            config.zone_gating["premium_zone"] = ZoneGatingConfig(
+                entry_timeframes=old.entry_timeframes,
+                require_htf_bias=old.require_htf_bias,
+                max_freshness_closes=old.max_freshness_closes,
+                allow_opposite_entry=old.allow_opposite_entry,
+                min_signal_quality_score=old.min_signal_quality_score,
+                require_fvg_confluence=True,
+                fvg_bonus=old.fvg_bonus,
+                premium_discount_fvg_bonus=old.premium_discount_fvg_bonus,
+            )
+        if getattr(args, "require_fvg_for_discount", False) and "discount_zone" in config.zone_gating:
+            old = config.zone_gating["discount_zone"]
+            config.zone_gating["discount_zone"] = ZoneGatingConfig(
+                entry_timeframes=old.entry_timeframes,
+                require_htf_bias=old.require_htf_bias,
+                max_freshness_closes=old.max_freshness_closes,
+                allow_opposite_entry=old.allow_opposite_entry,
+                min_signal_quality_score=old.min_signal_quality_score,
+                require_fvg_confluence=True,
+                fvg_bonus=old.fvg_bonus,
+                premium_discount_fvg_bonus=old.premium_discount_fvg_bonus,
+            )
+        if getattr(args, "require_fvg_for_fvg", False) and "fair_value_gap" in config.zone_gating:
+            old = config.zone_gating["fair_value_gap"]
+            config.zone_gating["fair_value_gap"] = ZoneGatingConfig(
+                entry_timeframes=old.entry_timeframes,
+                require_htf_bias=old.require_htf_bias,
+                max_freshness_closes=old.max_freshness_closes,
+                allow_opposite_entry=old.allow_opposite_entry,
+                min_signal_quality_score=old.min_signal_quality_score,
+                require_fvg_confluence=True,
+                fvg_bonus=old.fvg_bonus,
+                premium_discount_fvg_bonus=old.premium_discount_fvg_bonus,
+            )
     except Exception:
         pass
 
