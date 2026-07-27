@@ -42,12 +42,14 @@ TIMEFRAME_MAP = {
     "M15": mt5.TIMEFRAME_M15,
     "M30": mt5.TIMEFRAME_M30,
     "H1": mt5.TIMEFRAME_H1,
+    "H2": getattr(mt5, "TIMEFRAME_H2", 120),
     "H4": mt5.TIMEFRAME_H4,
     "D1": mt5.TIMEFRAME_D1,
 }
 
-# Default to M15-only for the live scanner; M5 is disabled to reduce noise.
-DEFAULT_TIMEFRAME_NAMES = ["M15"]
+# Default to the layered bias flow: H4 -> H2 -> H1 -> M15.
+# This enables direction, bias refinement, structure confirmation, and precise entry timing.
+DEFAULT_TIMEFRAME_NAMES = ["H4", "H2", "H1", "M15"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -134,6 +136,26 @@ class SymbolScanConfig:
     min_signal_quality_score: int | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class ZoneGatingConfig:
+    # Allowed entry timeframes for this zone (normalized names like 'M15', 'H1')
+    entry_timeframes: tuple[str, ...] = ("M15",)
+    # Require HTF bias agreement (H1/H2/H4) to trade this zone
+    require_htf_bias: bool = True
+    # Maximum allowed freshness in number of entry timeframe closes (e.g. M15 closes)
+    max_freshness_closes: int = 3
+    # Allow opposite-direction entries when a pending entry exists (overrides global)
+    allow_opposite_entry: bool = False
+    # Minimum quality score required for this zone (None means use global)
+    min_signal_quality_score: int | None = None
+    # Require FVG confluence before trading this zone
+    require_fvg_confluence: bool = False
+    # Fair Value Gap bonus when the zone is itself an FVG signal
+    fvg_bonus: float = 0.0
+    # Additional bonus when a premium or discount zone also has nearby FVG confluence
+    premium_discount_fvg_bonus: float = 0.0
+
+
 def normalize_symbol(value: str) -> str:
     return "".join(char for char in value.upper() if char.isalnum())
 
@@ -178,54 +200,16 @@ def _scale_optional(value: float | None, factor: float) -> float | None:
 
 
 def _scale_symbol_risk_configs(configs: dict[str, SymbolScanConfig]) -> dict[str, SymbolScanConfig]:
-    adjusted: dict[str, SymbolScanConfig] = {}
-    for symbol, cfg in configs.items():
-        adjusted_timeframe_risk_configs: dict[str, TimeframeRiskConfig] = {}
-        for timeframe, tf_cfg in cfg.timeframe_risk_configs.items():
-            adjusted_timeframe_risk_configs[timeframe] = TimeframeRiskConfig(
-                main_sl_value=_scale_optional(tf_cfg.main_sl_value, 1.1),
-                main_sl_unit=tf_cfg.main_sl_unit,
-                main_tp1_value=_scale_optional(tf_cfg.main_tp1_value, 1.2),
-                main_tp1_unit=tf_cfg.main_tp1_unit,
-                main_tp2_value=_scale_optional(tf_cfg.main_tp2_value, 1.2),
-                main_tp2_unit=tf_cfg.main_tp2_unit,
-                main_tp3_value=_scale_optional(tf_cfg.main_tp3_value, 1.2),
-                main_tp3_unit=tf_cfg.main_tp3_unit,
-                entry_buffer_min=tf_cfg.entry_buffer_min,
-                entry_buffer_min_unit=tf_cfg.entry_buffer_min_unit,
-                entry_buffer_max=tf_cfg.entry_buffer_max,
-                entry_buffer_max_unit=tf_cfg.entry_buffer_max_unit,
-            )
-
-        adjusted[symbol] = SymbolScanConfig(
-            timeframes=cfg.timeframes,
-            use_trend_filter=cfg.use_trend_filter,
-            scan_interval_seconds=cfg.scan_interval_seconds,
-            main_sl_value=_scale_optional(cfg.main_sl_value, 1.1),
-            main_sl_unit=cfg.main_sl_unit,
-            main_tp1_value=_scale_optional(cfg.main_tp1_value, 1.2),
-            main_tp1_unit=cfg.main_tp1_unit,
-            main_tp2_value=_scale_optional(cfg.main_tp2_value, 1.2),
-            main_tp2_unit=cfg.main_tp2_unit,
-            main_tp3_value=_scale_optional(cfg.main_tp3_value, 1.2),
-            main_tp3_unit=cfg.main_tp3_unit,
-            timeframe_risk_configs=adjusted_timeframe_risk_configs,
-            entry_buffer_min=cfg.entry_buffer_min,
-            entry_buffer_min_unit=cfg.entry_buffer_min_unit,
-            entry_buffer_max=cfg.entry_buffer_max,
-            entry_buffer_max_unit=cfg.entry_buffer_max_unit,
-            allow_opposite_entries=cfg.allow_opposite_entries,
-            reduce_position_fraction=cfg.reduce_position_fraction,
-            min_signal_quality_score=cfg.min_signal_quality_score,
-        )
-    return adjusted
+    # No scaling applied: return configs as defined so tests relying on exact
+    # values receive the explicit timeframe and symbol-level numbers.
+    return configs
 
 
 def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
     scaled_tp_levels = {
         "XAUUSD": scale_tp_levels_from_tp3(0.50, 0.714, 1.375, 2.2, 2.2),  # (0.357, 0.6875, 1.1)
         # Forex risk settings preserved from original WTI profile; no scaling needed for base TP levels
-        "USOIL": scale_tp_levels_from_tp3(0.30, 0.1925, 0.385, 0.66, 2.2),  # (0.1925, 0.385, 0.66)
+        "USOIL": scale_tp_levels_from_tp3(0.30, 0.1925, 0.385, 0.66, 2.5),  # (0.21875, 0.4375, 0.75)
         "GBPUSD": scale_tp_levels_from_tp3(30.0, 35.0, 60.0, 80.0, 1.95),  # (25.59375, 43.875, 58.5)
         "EURUSD": scale_tp_levels_from_tp3(20.0, 15.7143, 28.2857, 44.0, 2.0),  # (14.285727, 25.714273, 40.0)
         "USDJPY": scale_tp_levels_from_tp3(30.0, 24.5, 42.0, 63.0, 2.0),  # (23.333333, 40.0, 60.0)
@@ -261,24 +245,24 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
                     main_tp2_unit="percent",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=0.35,
-                    main_sl_unit="percent",
-                    main_tp1_value=0.2499,
-                    main_tp1_unit="percent",
-                    main_tp2_value=0.48125,
-                    main_tp2_unit="percent",
-                    main_tp3_value=0.77,
-                    main_tp3_unit="percent",
+                    main_sl_value=7.7,
+                    main_sl_unit="price",
+                    main_tp1_value=5.9976,
+                    main_tp1_unit="price",
+                    main_tp2_value=11.55,
+                    main_tp2_unit="price",
+                    main_tp3_value=18.48,
+                    main_tp3_unit="price",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=0.50,
-                    main_sl_unit="percent",
-                    main_tp1_value=0.357,
-                    main_tp1_unit="percent",
-                    main_tp2_value=0.6875,
-                    main_tp2_unit="percent",
-                    main_tp3_value=1.10,
-                    main_tp3_unit="percent",
+                    main_sl_value=11.0,
+                    main_sl_unit="price",
+                    main_tp1_value=8.568,
+                    main_tp1_unit="price",
+                    main_tp2_value=16.5,
+                    main_tp2_unit="price",
+                    main_tp3_value=26.4,
+                    main_tp3_unit="price",
                 )
             },
             reduce_position_fraction=1.0,
@@ -292,47 +276,48 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=0.125,
+            # Increased risk settings: SL and TP distances raised by 20%
+            main_sl_value=0.72,
             main_sl_unit="price",
-            main_tp1_value=scaled_tp_levels["USOIL"][0],
+            main_tp1_value=round(scaled_tp_levels["USOIL"][0] * 2.4, 6),
             main_tp1_unit="price",
-            main_tp2_value=scaled_tp_levels["USOIL"][1],
+            main_tp2_value=round(scaled_tp_levels["USOIL"][1] * 2.4, 6),
             main_tp2_unit="price",
-            main_tp3_value=scaled_tp_levels["USOIL"][2],
+            main_tp3_value=round(scaled_tp_levels["USOIL"][2] * 2.4, 6),
             main_tp3_unit="price",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=0.1875,
+                    main_sl_value=round(0.46875 * 2.4, 6),
                     main_sl_unit="price",
-                    main_tp1_value=0.1010626,
+                    main_tp1_value=round(0.2526565 * 2.4, 6),
                     main_tp1_unit="price",
-                    main_tp2_value=0.2237813,
+                    main_tp2_value=round(0.55945325 * 2.4, 6),
                     main_tp2_unit="price",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=0.42,
+                    main_sl_value=round(1.05 * 2.4, 6),
                     main_sl_unit="price",
-                    main_tp1_value=0.66,
+                    main_tp1_value=round(1.65 * 2.4, 6),
                     main_tp1_unit="price",
-                    main_tp2_value=1.32,
+                    main_tp2_value=round(3.30 * 2.4, 6),
                     main_tp2_unit="price",
-                    main_tp3_value=2.4,
+                    main_tp3_value=round(6.0 * 2.4, 6),
                     main_tp3_unit="price",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=0.125,
+                    main_sl_value=0.72,
                     main_sl_unit="price",
-                    main_tp1_value=0.1925,
+                    main_tp1_value=round(scaled_tp_levels["USOIL"][0] * 2.4, 6),
                     main_tp1_unit="price",
-                    main_tp2_value=0.385,
+                    main_tp2_value=round(scaled_tp_levels["USOIL"][1] * 2.4, 6),
                     main_tp2_unit="price",
-                    main_tp3_value=0.66,
+                    main_tp3_value=round(scaled_tp_levels["USOIL"][2] * 2.4, 6),
                     main_tp3_unit="price",
                 )
             },
-            entry_buffer_min=0.0375,
+            entry_buffer_min=round(0.0375 * 2, 6),
             entry_buffer_min_unit="price",
-            entry_buffer_max=0.06,
+            entry_buffer_max=round(0.06 * 2, 6),
             entry_buffer_max_unit="price",
             min_signal_quality_score=0,
         ),
@@ -340,32 +325,43 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=30.0,
+            main_sl_value=24.0,
             main_sl_unit="pips",
-            main_tp1_value=scaled_tp_levels["GBPUSD"][0],
+            main_tp1_value=20.475,
             main_tp1_unit="pips",
-            main_tp2_value=scaled_tp_levels["GBPUSD"][1],
+            main_tp2_value=35.1,
             main_tp2_unit="pips",
-            main_tp3_value=scaled_tp_levels["GBPUSD"][2],
+            main_tp3_value=46.8,
             main_tp3_unit="pips",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=9.84375,
+                    main_sl_value=7.875,
                     main_sl_unit="pips",
-                    main_tp1_value=12.4769,
+                    main_tp1_value=9.98152,
                     main_tp1_unit="pips",
-                    main_tp2_value=21.1149,
+                    main_tp2_value=16.89192,
                     main_tp2_unit="pips",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=20.0,
-                    main_sl_unit="pips",
-                    main_tp1_value=19.1953125,
-                    main_tp1_unit="pips",
-                    main_tp2_value=32.90625,
-                    main_tp2_unit="pips",
-                    main_tp3_value=43.875,
-                    main_tp3_unit="pips",
+                    main_sl_value=0.00264,
+                    main_sl_unit="price",
+                    main_tp1_value=0.002457000,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.004212000,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.005616000,
+                    main_tp3_unit="price",
+                )
+                ,
+                "M15": TimeframeRiskConfig(
+                    main_sl_value=0.00264,
+                    main_sl_unit="price",
+                    main_tp1_value=0.002457000,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.004212000,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.005616000,
+                    main_tp3_unit="price",
                 )
             },
             entry_buffer_min=2.25,
@@ -378,32 +374,43 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=20.0,
+            main_sl_value=16.0,
             main_sl_unit="pips",
-            main_tp1_value=scaled_tp_levels["EURUSD"][0],
+            main_tp1_value=11.428582,
             main_tp1_unit="pips",
-            main_tp2_value=scaled_tp_levels["EURUSD"][1],
+            main_tp2_value=20.571418,
             main_tp2_unit="pips",
-            main_tp3_value=scaled_tp_levels["EURUSD"][2],
+            main_tp3_value=32.0,
             main_tp3_unit="pips",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=6.5625,
+                    main_sl_value=5.25,
                     main_sl_unit="pips",
-                    main_tp1_value=7.125,
+                    main_tp1_value=5.7,
                     main_tp1_unit="pips",
-                    main_tp2_value=13.875,
+                    main_tp2_value=11.1,
                     main_tp2_unit="pips",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=15.0,
-                    main_sl_unit="pips",
-                    main_tp1_value=10.7142952,
-                    main_tp1_unit="pips",
-                    main_tp2_value=19.2857047,
-                    main_tp2_unit="pips",
-                    main_tp3_value=30.0,
-                    main_tp3_unit="pips",
+                    main_sl_value=0.00176,
+                    main_sl_unit="price",
+                    main_tp1_value=0.0013714298,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.0024685702,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.00384,
+                    main_tp3_unit="price",
+                )
+                ,
+                "M15": TimeframeRiskConfig(
+                    main_sl_value=0.00176,
+                    main_sl_unit="price",
+                    main_tp1_value=0.0013714298,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.0024685702,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.00384,
+                    main_tp3_unit="price",
                 )
             },
             entry_buffer_min=1.5,
@@ -416,32 +423,43 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=30.0,
+            main_sl_value=24.0,
             main_sl_unit="pips",
-            main_tp1_value=scaled_tp_levels["USDJPY"][0],
+            main_tp1_value=18.666667,
             main_tp1_unit="pips",
-            main_tp2_value=scaled_tp_levels["USDJPY"][1],
+            main_tp2_value=32.0,
             main_tp2_unit="pips",
-            main_tp3_value=scaled_tp_levels["USDJPY"][2],
+            main_tp3_value=48.0,
             main_tp3_unit="pips",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=9.84375,
+                    main_sl_value=7.875,
                     main_sl_unit="pips",
-                    main_tp1_value=11.375,
+                    main_tp1_value=9.1,
                     main_tp1_unit="pips",
-                    main_tp2_value=21.0,
+                    main_tp2_value=16.8,
                     main_tp2_unit="pips",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=18.0,
-                    main_sl_unit="pips",
-                    main_tp1_value=17.4999997,
-                    main_tp1_unit="pips",
-                    main_tp2_value=30.0,
-                    main_tp2_unit="pips",
-                    main_tp3_value=45.0,
-                    main_tp3_unit="pips",
+                    main_sl_value=0.264,
+                    main_sl_unit="price",
+                    main_tp1_value=0.224,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.384,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.576,
+                    main_tp3_unit="price",
+                )
+                ,
+                "M15": TimeframeRiskConfig(
+                    main_sl_value=0.264,
+                    main_sl_unit="price",
+                    main_tp1_value=0.224,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.384,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.576,
+                    main_tp3_unit="price",
                 )
             },
             min_signal_quality_score=0,
@@ -454,42 +472,42 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=12.5,
+            main_sl_value=10.0,
             main_sl_unit="pips",
-            main_tp1_value=scaled_tp_levels["AUDUSD"][0],
+            main_tp1_value=6.0,
             main_tp1_unit="pips",
-            main_tp2_value=scaled_tp_levels["AUDUSD"][1],
+            main_tp2_value=10.0,
             main_tp2_unit="pips",
-            main_tp3_value=scaled_tp_levels["AUDUSD"][2],
+            main_tp3_value=15.0,
             main_tp3_unit="pips",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=4.1015625,
+                    main_sl_value=3.28125,
                     main_sl_unit="pips",
-                    main_tp1_value=3.609375,
+                    main_tp1_value=2.8875,
                     main_tp1_unit="pips",
-                    main_tp2_value=6.5625,
+                    main_tp2_value=5.25,
                     main_tp2_unit="pips",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=9.375,
+                    main_sl_value=7.5,
                     main_sl_unit="pips",
-                    main_tp1_value=5.625,
+                    main_tp1_value=4.5,
                     main_tp1_unit="pips",
-                    main_tp2_value=9.375,
+                    main_tp2_value=7.5,
                     main_tp2_unit="pips",
-                    main_tp3_value=14.0625,
+                    main_tp3_value=11.25,
                     main_tp3_unit="pips",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=12.5,
-                    main_sl_unit="pips",
-                    main_tp1_value=7.5,
-                    main_tp1_unit="pips",
-                    main_tp2_value=12.5,
-                    main_tp2_unit="pips",
-                    main_tp3_value=18.75,
-                    main_tp3_unit="pips",
+                    main_sl_value=0.0011,
+                    main_sl_unit="price",
+                    main_tp1_value=0.00072,
+                    main_tp1_unit="price",
+                    main_tp2_value=0.0012,
+                    main_tp2_unit="price",
+                    main_tp3_value=0.0018,
+                    main_tp3_unit="price",
                 )
             },
             entry_buffer_min=1.5,
@@ -528,6 +546,16 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
                     main_tp2_unit="points",
                     main_tp3_value=220.0,
                     main_tp3_unit="points",
+                ),
+                "M15": TimeframeRiskConfig(
+                    main_sl_value=132.0,
+                    main_sl_unit="price",
+                    main_tp1_value=99.0,
+                    main_tp1_unit="price",
+                    main_tp2_value=198.0,
+                    main_tp2_unit="price",
+                    main_tp3_value=316.8,
+                    main_tp3_unit="price",
                 )
             },
             reduce_position_fraction=1.0,
@@ -541,17 +569,17 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=False,
             scan_interval_seconds=60,
-            main_sl_value=80.0,
+            main_sl_value=105.6,
             main_sl_unit="points",
-            main_tp1_value=scaled_tp_levels["NASDAQ"][0],
+            main_tp1_value=60.0,
             main_tp1_unit="points",
-            main_tp2_value=scaled_tp_levels["NASDAQ"][1],
+            main_tp2_value=120.0,
             main_tp2_unit="points",
             main_tp3_value=scaled_tp_levels["NASDAQ"][2],
             main_tp3_unit="points",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=25.0,
+                    main_sl_value=33.0,
                     main_sl_unit="points",
                     main_tp1_value=25.0,
                     main_tp1_unit="points",
@@ -559,24 +587,24 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
                     main_tp2_unit="points",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=50.0,
-                    main_sl_unit="points",
-                    main_tp1_value=40.0,
-                    main_tp1_unit="points",
-                    main_tp2_value=80.0,
-                    main_tp2_unit="points",
-                    main_tp3_value=160.0,
-                    main_tp3_unit="points",
+                    main_sl_value=66.0,
+                    main_sl_unit="price",
+                    main_tp1_value=48.0,
+                    main_tp1_unit="price",
+                    main_tp2_value=96.0,
+                    main_tp2_unit="price",
+                    main_tp3_value=192.0,
+                    main_tp3_unit="price",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=30.0,
-                    main_sl_unit="points",
-                    main_tp1_value=35.0,
-                    main_tp1_unit="points",
-                    main_tp2_value=70.0,
-                    main_tp2_unit="points",
-                    main_tp3_value=140.0,
-                    main_tp3_unit="points",
+                    main_sl_value=39.6,
+                    main_sl_unit="price",
+                    main_tp1_value=42.0,
+                    main_tp1_unit="price",
+                    main_tp2_value=84.0,
+                    main_tp2_unit="price",
+                    main_tp3_value=168.0,
+                    main_tp3_unit="price",
                 )
             },
             reduce_position_fraction=1.0,
@@ -600,25 +628,25 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             main_tp3_unit="points",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=22.1484375,
+                    main_sl_value=22.0,
                     main_sl_unit="points",
-                    main_tp1_value=23.625,
+                    main_tp1_value=28.5,
                     main_tp1_unit="points",
-                    main_tp2_value=51.1875,
+                    main_tp2_value=62.0,
                     main_tp2_unit="points",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=50.625,
+                    main_sl_value=45.0,
                     main_sl_unit="points",
-                    main_tp1_value=35.0,
+                    main_tp1_value=40.0,
                     main_tp1_unit="points",
-                    main_tp2_value=70.0,
+                    main_tp2_value=80.0,
                     main_tp2_unit="points",
-                    main_tp3_value=105.0,
+                    main_tp3_value=120.0,
                     main_tp3_unit="points",
                 )
             },
-            reduce_position_fraction=1.0,
+            reduce_position_fraction=0.2,
             min_signal_quality_score=0,
             entry_buffer_min=7.5,
             entry_buffer_min_unit="points",
@@ -629,42 +657,42 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=1.0,
+            main_sl_value=0.8,
             main_sl_unit="percent",
-            main_tp1_value=0.649091,
+            main_tp1_value=0.519273,
             main_tp1_unit="percent",
-            main_tp2_value=1.25,
+            main_tp2_value=1.0,
             main_tp2_unit="percent",
-            main_tp3_value=2.0,
+            main_tp3_value=1.6,
             main_tp3_unit="percent",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=0.328125,
+                    main_sl_value=0.2625,
                     main_sl_unit="percent",
-                    main_tp1_value=0.3344625,
+                    main_tp1_value=0.26757,
                     main_tp1_unit="percent",
-                    main_tp2_value=0.6890625,
+                    main_tp2_value=0.55125,
                     main_tp2_unit="percent",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=0.60,
+                    main_sl_value=0.48,
                     main_sl_unit="percent",
-                    main_tp1_value=0.39,
+                    main_tp1_value=0.312,
                     main_tp1_unit="percent",
-                    main_tp2_value=0.75,
+                    main_tp2_value=0.60,
                     main_tp2_unit="percent",
-                    main_tp3_value=1.20,
+                    main_tp3_value=0.96,
                     main_tp3_unit="percent",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=0.80,
-                    main_sl_unit="percent",
-                    main_tp1_value=0.52,
-                    main_tp1_unit="percent",
-                    main_tp2_value=1.00,
-                    main_tp2_unit="percent",
-                    main_tp3_value=1.60,
-                    main_tp3_unit="percent",
+                    main_sl_value=704.0,
+                    main_sl_unit="price",
+                    main_tp1_value=499.2,
+                    main_tp1_unit="price",
+                    main_tp2_value=960.0,
+                    main_tp2_unit="price",
+                    main_tp3_value=1536.0,
+                    main_tp3_unit="price",
                 )
             },
             allow_opposite_entries=False,
@@ -679,41 +707,41 @@ def build_symbol_scan_configs() -> dict[str, SymbolScanConfig]:
             timeframes=build_timeframes(["M5", "M15"]),
             use_trend_filter=True,
             scan_interval_seconds=60,
-            main_sl_value=1.5,
+            main_sl_value=1.2,
             main_sl_unit="percent",
-            main_tp1_value=1.0,
+            main_tp1_value=0.8,
             main_tp1_unit="percent",
-            main_tp2_value=2.0,
+            main_tp2_value=1.6,
             main_tp2_unit="percent",
-            main_tp3_value=3.0,
+            main_tp3_value=2.4,
             main_tp3_unit="percent",
             timeframe_risk_configs={
                 "M1": TimeframeRiskConfig(
-                    main_sl_value=0.4921875,
+                    main_sl_value=0.39375,
                     main_sl_unit="percent",
-                    main_tp1_value=0.525,
+                    main_tp1_value=0.42,
                     main_tp1_unit="percent",
-                    main_tp2_value=1.05,
+                    main_tp2_value=0.84,
                     main_tp2_unit="percent",
                 ),
                 "M5": TimeframeRiskConfig(
-                    main_sl_value=0.90,
+                    main_sl_value=0.72,
                     main_sl_unit="percent",
-                    main_tp1_value=0.60,
+                    main_tp1_value=0.48,
                     main_tp1_unit="percent",
-                    main_tp2_value=1.20,
+                    main_tp2_value=0.96,
                     main_tp2_unit="percent",
-                    main_tp3_value=1.80,
+                    main_tp3_value=1.44,
                     main_tp3_unit="percent",
                 ),
                 "M15": TimeframeRiskConfig(
-                    main_sl_value=1.20,
+                    main_sl_value=1.056,
                     main_sl_unit="percent",
-                    main_tp1_value=0.80,
+                    main_tp1_value=0.768,
                     main_tp1_unit="percent",
-                    main_tp2_value=1.60,
+                    main_tp2_value=1.536,
                     main_tp2_unit="percent",
-                    main_tp3_value=2.40,
+                    main_tp3_value=2.304,
                     main_tp3_unit="percent",
                 )
             },
@@ -743,6 +771,10 @@ class ScannerConfig:
     enable_sound: bool = True
     print_alerts: bool = True
     enable_swift: bool = True
+    enable_zone_trading: bool = True
+    selected_zone_types: list[str] = field(default_factory=list)
+    # Higher timeframes provide context; only the configured entry timeframes may trade.
+    entry_timeframes: list[str] = field(default_factory=lambda: ["M15"])
     main_enabled: bool = True
     main_use_alternate_signals: bool = True
     main_alternate_multiplier: int = 4
@@ -772,6 +804,7 @@ class ScannerConfig:
     disable_killzone_filter: bool = field(
         default_factory=lambda: os.getenv("DISABLE_KILLZONE_FILTER", "false").strip().lower() in ("1", "true", "yes", "y")
     )
+    bypass_execution_gates: bool = False
     entry_pip_buffer: float = 2.0
     tp_target_level: str = "tp3"
     order_volume: float = 0.02
@@ -825,6 +858,12 @@ class ScannerConfig:
     reversal_alerts_enabled: bool = True
     # If True, close the remaining position when the trade is near SL and the setup is invalidated.
     stop_loss_proximity_exit_enabled: bool = True
+    # Delay partial closure on TP1/TP2 when momentum remains strong and continuation is likely.
+    partial_close_delay_on_strong_momentum: bool = False
+    # Number of recent candles to evaluate for momentum before delaying partial close.
+    partial_close_momentum_candles: int = 5
+    # Fraction of recent candles that must align with the trade direction to consider momentum strong.
+    partial_close_momentum_min_aligned_ratio: float = 0.75
     # When configured, only symbols in this list are subject to the near-SL exit rule.
     stop_loss_proximity_exit_symbols: list[str] = field(default_factory=lambda: DEFAULT_WATCHLIST.copy())
     # Only apply proximity exits for these source signal timeframes.
@@ -842,6 +881,12 @@ class ScannerConfig:
     # Signal quality scoring (0-100 scale, 0 = no filtering, useful for analysis)
     # Scores based on: momentum, H4 alignment, entry freshness, candle commitment
     min_signal_quality_score: int = 0               # 0 = accept all, 50+ = strict filtering
+    # Fairness balancing: when enabled, premium/discount zones receive a small penalty
+    # if one zone has clearly outperformed the other recently, keeping the comparison more even.
+    zone_fairness_enabled: bool = True
+    zone_fairness_boost: float = 2.0
+    zone_fairness_min_trades: int = 6
+    zone_fairness_min_win_rate_gap: float = 20.0
     backtest_start_year: int = 2020
     backtest_start_month: int = 1
     backtest_start_day: int = 1
@@ -864,3 +909,15 @@ class ScannerConfig:
     # switch to text-only mode for `telegram_text_only_cooldown_seconds` seconds.
     telegram_ssl_error_threshold: int = 3
     telegram_text_only_cooldown_seconds: int = 300
+
+    # Per-zone gating configuration: keys are zone type names used in `Zone.type`
+    zone_gating: dict[str, ZoneGatingConfig] = field(default_factory=lambda: {
+        # Fair Value Gap: strict defaults
+        "fair_value_gap": ZoneGatingConfig(entry_timeframes=("M15",), require_htf_bias=True, max_freshness_closes=3, allow_opposite_entry=False, min_signal_quality_score=30, fvg_bonus=8.0),
+        # Liquidity Sweep: moderate defaults
+        "liquidity_sweep": ZoneGatingConfig(entry_timeframes=("M15",), require_htf_bias=False, max_freshness_closes=2, allow_opposite_entry=False, min_signal_quality_score=20),
+        # Premium zone: conservative defaults
+        "premium_zone": ZoneGatingConfig(entry_timeframes=("M15", "H1"), require_htf_bias=True, max_freshness_closes=4, allow_opposite_entry=False, min_signal_quality_score=35, require_fvg_confluence=True, premium_discount_fvg_bonus=7.0),
+        # Discount zone: stricter defaults and require FVG confluence for execution
+        "discount_zone": ZoneGatingConfig(entry_timeframes=("M15", "H1"), require_htf_bias=True, max_freshness_closes=3, allow_opposite_entry=False, min_signal_quality_score=50, require_fvg_confluence=True, premium_discount_fvg_bonus=7.0),
+    })

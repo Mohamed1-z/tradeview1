@@ -87,6 +87,20 @@ Alert-only monitoring:
 python app.py --interval 30 --telegram-only --disable-execution
 ```
 
+## Run tests
+
+Run watcher regression tests with:
+
+```bash
+python -m pytest tests/test_watcher.py -q -k "retry_pending_execution"
+```
+
+This covers the pending execution retry and alert flow regression cases.
+
+```bash
+python app.py --interval 30 --telegram-only --disable-execution
+```
+
 Live MT5 execution is enabled by default. To place real orders, MT5 must be open,
 logged in, and allowed to trade; run the watcher without `--disable-execution`.
 Entry signals wait for the configured pip buffer before sending a market order.
@@ -106,6 +120,21 @@ python app.py --once --disable-alternate-signals
 python app.py --once --main-ma TEMA
 python app.py --once --main-tp 1 1.5 2 --main-sl 0.5
 ```
+
+### Select premium / discount zone detection
+When the scanner starts, it prompts you to choose detectors. You can type:
+
+```text
+swift premium discount
+```
+
+or use aliases:
+
+```text
+fvg premium discount
+```
+
+That enables `premium_zone` and `discount_zone` scanning with the new FVG confluence scoring.
 
 ## TP/SL Outcome Report
 

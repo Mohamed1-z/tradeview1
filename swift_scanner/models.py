@@ -3,20 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Any
 from swift_scanner.config import TIMEFRAME_MAP
 
 
 ZoneType = Literal[
     "swift_signal",
-    "order_block",
     "fair_value_gap",
     "liquidity_sweep",
     "premium_zone",
     "discount_zone",
 ]
 SignalDirection = Literal["bullish", "bearish"]
-SignalSource = Literal["swift"]
+SignalSource = Literal["swift", "zone"]
 
 
 @dataclass(slots=True)
@@ -146,7 +145,6 @@ class SignalEvent:
 
         direction = str(
             payload.get("signal_direction")
-            or payload.get("order_block_direction")
             or payload.get("direction")
             or payload.get("zone_direction")
             or ""
@@ -292,7 +290,7 @@ class ScanResult:
     symbol_request: str
     symbol_actual: str
     timeframe: str
-    bars: "pd.DataFrame"
+    bars: Any
     zones: list[Zone]
     fresh_events: list[SignalEvent]
     latest_close: float

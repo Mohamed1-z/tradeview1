@@ -80,7 +80,6 @@ def _detect_pattern_confirmation(data: pd.DataFrame, direction: str, index: int,
         prev_prev_high = float(prev_prev_bar["high"])
         prev_prev_low = float(prev_prev_bar["low"])
         prev_prev_close = float(prev_prev_bar["close"])
-        prev_prev_open = float(prev_prev_bar["open"])
         prev_range = prev_high - prev_low
         prev_prev_range = prev_prev_high - prev_prev_low
         if direction == "bullish" and current_high > prev_high and current_close > prev_close and current_close > prev_prev_close:
@@ -721,50 +720,6 @@ def _build_zone(
     )
 
 
-def _detect_order_blocks(
-    data: pd.DataFrame,
-    symbol_request: str,
-    symbol_actual: str,
-) -> list[Zone]:
-    zones: list[Zone] = []
-    for idx in range(1, len(data)):
-        prev = data.iloc[idx - 1]
-        curr = data.iloc[idx]
-        if curr["close"] > curr["open"] and curr["close"] > prev["high"] and prev["close"] < prev["open"]:
-            zones.append(
-                _build_zone(
-                    symbol_request,
-                    symbol_actual,
-                    "bullish",
-                    "order_block",
-                    _to_datetime(prev["time"]),
-                    idx - 1,
-                    idx,
-                    top=prev["high"],
-                    bottom=prev["low"],
-                    formed_index=idx - 1,
-                    metadata={"reason": "bullish reversal order block"},
-                )
-            )
-        elif curr["close"] < curr["open"] and curr["close"] < prev["low"] and prev["close"] > prev["open"]:
-            zones.append(
-                _build_zone(
-                    symbol_request,
-                    symbol_actual,
-                    "bearish",
-                    "order_block",
-                    _to_datetime(prev["time"]),
-                    idx - 1,
-                    idx,
-                    top=prev["high"],
-                    bottom=prev["low"],
-                    formed_index=idx - 1,
-                    metadata={"reason": "bearish reversal order block"},
-                )
-            )
-    return zones
-
-
 def _detect_fvg_zones(
     data: pd.DataFrame,
     symbol_request: str,
@@ -922,6 +877,64 @@ def _annotate_events_with_zone_tags(events: list[SignalEvent], zones: list[Zone]
             elif zone.bottom <= event.price <= zone.top:
                 tags.add(zone.zone_type)
         event.signal_tags = sorted(tags)
+
+
+def _make_zone_trade_events(
+    data: pd.DataFrame,
+    zones: list[Zone],
+    symbol_request: str,
+    symbol_actual: str,
+    timeframe_name: str,
+    fresh_threshold: int,
+) -> list[SignalEvent]:
+    """Turn newly formed zones containing the latest close into trade candidates."""
+    latest_index = len(data) - 1
+    latest_close = float(data.iloc[-1]["close"])
+    candidates: list[SignalEvent] = []
+    seen_types: set[str] = set()
+    for zone in sorted(zones, key=lambda item: item.formed_index or -1, reverse=True):
+        active_index = zone.right_index
+        if active_index < fresh_threshold or active_index > latest_index:
+            continue
+        if zone.zone_type in seen_types or not zone.bottom <= latest_close <= zone.top:
+            continue
+        zone_range = max(float(zone.top) - float(zone.bottom), abs(latest_close) * 0.0001)
+        risk = zone_range * 1.10
+        if zone.direction == "bullish":
+            stop_loss = latest_close - risk
+            tp1 = latest_close + risk
+            tp2 = latest_close + risk * 1.5
+            tp3 = latest_close + risk * 2.0
+        else:
+            stop_loss = latest_close + risk
+            tp1 = latest_close - risk
+            tp2 = latest_close - risk * 1.5
+            tp3 = latest_close - risk * 2.0
+        label = zone.zone_type.replace("_", " ").title()
+        candidates.append(
+            SignalEvent(
+                symbol_request=symbol_request,
+                symbol_actual=symbol_actual,
+                timeframe=timeframe_name.strip().upper(),
+                triggered_at=_to_datetime(data.iloc[-1]["time"]),
+                price=latest_close,
+                zone=zone,
+                signal_source="zone",
+                signal_label=f"Zone {label} Entry",
+                explanation=f"Fresh {label} zone contains the latest close and agrees with a {zone.direction} setup.",
+                lesson=f"Zone trade source: {label}. The setup is invalid below/above the zone boundary.",
+                signal_tags=[zone.zone_type],
+                entry_price=latest_close,
+                stop_loss=stop_loss,
+                take_profit=tp3,
+                take_profit_1=tp1,
+                take_profit_2=tp2,
+                take_profit_3=tp3,
+                risk_reward_ratio=2.0,
+            )
+        )
+        seen_types.add(zone.zone_type)
+    return candidates
 
 
 def _make_zone(
@@ -1647,7 +1660,6 @@ def scan_swift(
         if event.zone.formed_index >= fresh_threshold
     ]
     extra_zones: list[Zone] = []
-    extra_zones.extend(_detect_order_blocks(bars, symbol_request, symbol_actual))
     extra_zones.extend(_detect_fvg_zones(bars, symbol_request, symbol_actual))
     extra_zones.extend(_detect_liquidity_sweeps(bars, symbol_request, symbol_actual))
     extra_zones.extend(_detect_premium_discount_zones(bars, symbol_request, symbol_actual))
@@ -1658,6 +1670,17 @@ def scan_swift(
 
     result_zones = list(zones_by_key.values())
     _annotate_events_with_zone_tags(fresh_events, result_zones)
+    if config.enable_zone_trading:
+        fresh_events.extend(
+            _make_zone_trade_events(
+                bars,
+                extra_zones,
+                symbol_request,
+                symbol_actual,
+                timeframe_name,
+                fresh_threshold,
+            )
+        )
 
     return ScanResult(
         symbol_request=symbol_request,

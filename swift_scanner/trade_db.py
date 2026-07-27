@@ -26,7 +26,6 @@ Usage:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 
 DB_PATH = Path("trades.db")
@@ -37,6 +36,9 @@ CREATE TABLE IF NOT EXISTS signals (
     symbol TEXT NOT NULL,
     timeframe TEXT NOT NULL,
     direction TEXT NOT NULL,
+    zone_type TEXT NOT NULL DEFAULT 'swift_signal',
+    signal_source TEXT NOT NULL DEFAULT 'swift',
+    signal_label TEXT,
     triggered_at TEXT NOT NULL,
     price REAL,
     entry_price REAL,
@@ -83,6 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_closures_ticket ON closures(ticket);
 class TradeDB:
     def __init__(self, db_path: str | Path = DB_PATH):
         self.db_path = Path(db_path)
+        self._pattern_stats_cache: dict[tuple[str, str, str, str], dict[str, object]] = {}
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -93,19 +96,36 @@ class TradeDB:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._upgrade_schema(conn)
+
+    def _upgrade_schema(self, conn: sqlite3.Connection) -> None:
+        def _has_column(table: str, column: str) -> bool:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(row["name"] == column for row in cur.fetchall())
+
+        if not _has_column("signals", "zone_type"):
+            conn.execute("ALTER TABLE signals ADD COLUMN zone_type TEXT NOT NULL DEFAULT 'swift_signal'")
+        if not _has_column("signals", "signal_source"):
+            conn.execute("ALTER TABLE signals ADD COLUMN signal_source TEXT NOT NULL DEFAULT 'swift'")
+        if not _has_column("signals", "signal_label"):
+            conn.execute("ALTER TABLE signals ADD COLUMN signal_label TEXT")
 
     def record_signal(self, event) -> int:
         """Insert a detected signal event. Returns the new signal row id."""
         with self._connect() as conn:
             cur = conn.execute(
                 """INSERT INTO signals
-                   (symbol, timeframe, direction, triggered_at, price,
-                    entry_price, stop_loss, take_profit_1, take_profit_2, take_profit_3)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (symbol, timeframe, direction, zone_type, signal_source, signal_label,
+                    triggered_at, price, entry_price, stop_loss,
+                    take_profit_1, take_profit_2, take_profit_3)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event.symbol_actual,
                     event.timeframe,
                     event.zone.direction,
+                    getattr(event.zone, "zone_type", "swift_signal"),
+                    getattr(event, "signal_source", "swift"),
+                    getattr(event, "signal_label", ""),
                     event.triggered_at.isoformat() if hasattr(event.triggered_at, "isoformat") else str(event.triggered_at),
                     float(event.price) if event.price else None,
                     float(event.entry_price) if event.entry_price else None,
@@ -139,6 +159,14 @@ class TradeDB:
                 ),
             )
 
+    def associate_execution_with_signal(self, ticket: int, signal_id: int) -> None:
+        """Link a previously recorded execution row to its detected signal row."""
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE executions SET signal_id = ? WHERE ticket = ?""",
+                (signal_id, ticket),
+            )
+
     def record_close(self, ticket: int, exit_price: float, outcome: str, pnl: float, pnl_r: float | None = None) -> None:
         """Insert a record for a position close (full or partial)."""
         with self._connect() as conn:
@@ -147,6 +175,7 @@ class TradeDB:
                    VALUES (?, ?, ?, ?, ?)""",
                 (ticket, float(exit_price), outcome, float(pnl), pnl_r),
             )
+            self._invalidate_pattern_cache()
 
     def get_trades_by_symbol(self, symbol: str) -> list[dict]:
         with self._connect() as conn:
@@ -159,6 +188,61 @@ class TradeDB:
                 (symbol,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_pattern_stats(self, symbol: str, timeframe: str, direction: str, zone_type: str) -> dict[str, object]:
+        cache_key = (symbol, timeframe, direction, zone_type)
+        cached = self._pattern_stats_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT
+                       COUNT(*) as total_closed,
+                       SUM(CASE WHEN c.pnl > 0 THEN 1 ELSE 0 END) as wins,
+                       SUM(c.pnl) as total_pnl,
+                       AVG(c.pnl) as avg_pnl,
+                       AVG(c.pnl_r) as avg_pnl_r
+                   FROM signals s
+                   JOIN executions e ON e.signal_id = s.id
+                   JOIN closures c ON c.ticket = e.ticket
+                   WHERE s.symbol = ?
+                   AND s.timeframe = ?
+                   AND s.direction = ?
+                   AND s.zone_type = ?""",
+                (symbol, timeframe, direction, zone_type),
+            ).fetchone()
+
+        total_closed = int(row["total_closed"] or 0)
+        wins = int(row["wins"] or 0)
+        total_pnl = float(row["total_pnl"] or 0.0)
+        avg_pnl = float(row["avg_pnl"] or 0.0)
+        avg_pnl_r = float(row["avg_pnl_r"] or 0.0)
+        win_rate_pct = round((wins / total_closed * 100.0), 1) if total_closed else 0.0
+
+        if total_closed < 5:
+            recommendation = "insufficient history"
+        elif win_rate_pct >= 60.0:
+            recommendation = "favorable"
+        elif win_rate_pct >= 40.0:
+            recommendation = "mixed"
+        else:
+            recommendation = "weak"
+
+        result = {
+            "total_closed": total_closed,
+            "wins": wins,
+            "win_rate_pct": win_rate_pct,
+            "total_pnl": round(total_pnl, 2),
+            "avg_pnl": round(avg_pnl, 4),
+            "avg_pnl_r": round(avg_pnl_r, 4) if avg_pnl_r else None,
+            "recommendation": recommendation,
+        }
+        self._pattern_stats_cache[cache_key] = result
+        return result
+
+    def _invalidate_pattern_cache(self) -> None:
+        self._pattern_stats_cache.clear()
 
     def get_summary_stats(self) -> dict:
         with self._connect() as conn:

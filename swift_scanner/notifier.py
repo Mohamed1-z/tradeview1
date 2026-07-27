@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import platform
 from pathlib import Path
 import time
@@ -64,21 +65,34 @@ def format_decision_brief(event: SignalEvent, multiline: bool = False) -> str:
     action = (event.decision_action or "").strip()
     mood = (event.decision_mood or "").strip()
     reason = (event.decision_reason or "").strip()
+    self_talk = (event.decision_self_talk or "").strip()
     confidence = event.decision_confidence
-    if not action and not mood and not reason and confidence is None:
+    if not action and not mood and not reason and confidence is None and not self_talk:
         return ""
 
     confidence_text = f"{confidence:.0f}/100" if confidence is not None else "n/a"
     header_parts = [part for part in (action, mood) if part]
     header = " / ".join(header_parts) if header_parts else "Decision"
+
+    def _clean(text: str) -> str:
+        return (
+            text.replace("; ", " ")
+            .replace("thesis: ", "Thesis: ")
+            .replace("invalidated if: ", "Invalidated if: ")
+            .replace("risk: ", "Risk: ")
+        )
+
     if multiline:
         lines = [f"Decision: {header}", f"Confidence: {confidence_text}"]
+        if self_talk:
+            lines.append(f"Self-talk: {_clean(self_talk)}")
         if reason:
-            lines.append(f"Reason: {reason.replace('; ', ' ').replace('thesis: ', 'Thesis: ').replace('invalidated if: ', 'Invalidated if: ').replace('risk: ', 'Risk: ')}")
+            lines.append(f"Reason: {_clean(reason)}")
         return "\n" + "\n".join(lines)
 
-    reason_part = f" | reason={reason.replace('; ', ' ').replace('thesis: ', 'Thesis: ').replace('invalidated if: ', 'Invalidated if: ').replace('risk: ', 'Risk: ')}" if reason else ""
-    return f" | decision={header} | confidence={confidence_text}{reason_part}"
+    reason_part = f" | reason={_clean(reason)}" if reason else ""
+    self_talk_part = f" | self-talk={_clean(self_talk)}" if self_talk else ""
+    return f" | decision={header} | confidence={confidence_text}{self_talk_part}{reason_part}"
 
 
 class SignalNotifier:
@@ -240,8 +254,8 @@ class SignalNotifier:
                 print("In text-only mode due to SSL errors: sent text-only alert.")
                 return
             except Exception:
-                # fall through to normal handling so failure is logged
                 pass
+
         url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendPhoto"
         risk_lines = ""
         if event.stop_loss is not None:
@@ -282,6 +296,7 @@ class SignalNotifier:
                 f"{target_line}"
                 f"\nRR: {rr}"
             )
+
         alert_prefix = "MARKET CHANGE ALERT: " if event.market_change_alert else ""
         explanation = format_signal_explanation(event)
         lesson = f"\nLesson: {event.lesson.strip()}" if event.lesson else ""
@@ -296,35 +311,41 @@ class SignalNotifier:
             f"{decision_lines}"
             f"{lesson}"
         )
-        image_bytes = image_path.read_bytes()
+        if len(caption) > 900:
+            caption = caption[:900].rstrip() + "..."
+
         failures: list[str] = []
         delivered = 0
-        for chat_id in self.config.telegram_chat_ids:
-            try:
-                response = self._post_with_retries(
-                    url,
-                    data={
-                        "chat_id": chat_id,
-                        "caption": caption,
-                        "disable_notification": str(self.config.telegram_silent).lower(),
-                    },
-                    files={"photo": (image_path.name, image_bytes, "image/png")},
-                    timeout=30,
-                )
-            except requests.exceptions.RequestException as exc:
-                # network-level failures (DNS, connection, timeouts)
-                failures.append(f"{chat_id}: network error: {exc}")
-                # If the error looks like an SSL EOF, attempt a text-only fallback below after the loop
-                continue
+        if not image_path.exists() or not image_path.is_file():
+            failures.append(f"image missing or unreadable: {image_path}")
+        else:
+            image_bytes = image_path.read_bytes()
+            content_type, _ = mimetypes.guess_type(image_path.name)
+            if not content_type:
+                content_type = "application/octet-stream"
+            for chat_id in self.config.telegram_chat_ids:
+                try:
+                    response = self._post_with_retries(
+                        url,
+                        data={
+                            "chat_id": chat_id,
+                            "caption": caption,
+                            "disable_notification": str(self.config.telegram_silent).lower(),
+                        },
+                        files={"photo": (image_path.name, image_bytes, content_type)},
+                        timeout=30,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    failures.append(f"{chat_id}: network error: {exc}")
+                    continue
 
-            try:
-                self.raise_for_telegram_error(response)
-                delivered += 1
-            except RuntimeError as exc:
-                failures.append(f"{chat_id}: {exc}")
+                try:
+                    self.raise_for_telegram_error(response)
+                    delivered += 1
+                except RuntimeError as exc:
+                    failures.append(f"{chat_id}: {exc}")
 
         if delivered == 0 and failures:
-            # Attempt a text-only fallback to at least deliver the alert without the image.
             fallback_msg = (
                 f"ALERT (image upload failed) - {event.symbol_request} ({event.symbol_actual}) {event.signal_label} on {event.timeframe}\n"
                 f"Price: {event.price:.5f}\nDirection: {event.zone.direction.title()}\n{risk_lines}\n"
@@ -340,41 +361,11 @@ class SignalNotifier:
                 print("Image upload failed; sent text-only fallback alert to Telegram.")
                 return
 
-            # text fallback didn't deliver either — log and raise
             self._log_telegram_failure(event, " | ".join(failures))
             raise RuntimeError("Telegram delivery failed for all recipients. " + " | ".join(failures))
+
         if failures:
             print("Telegram delivery warning: " + " | ".join(failures))
-
-    def send_test_message(self) -> int:
-        self.validate_telegram()
-        url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
-        failures: list[str] = []
-        delivered = 0
-        for chat_id in self.config.telegram_chat_ids:
-            try:
-                response = self._post_with_retries(
-                    url,
-                    data={
-                        "chat_id": chat_id,
-                        "text": "SWIFT watcher is connected and ready to send image alerts.",
-                        "disable_notification": str(self.config.telegram_silent).lower(),
-                    },
-                    timeout=30,
-                )
-            except requests.exceptions.RequestException as exc:
-                failures.append(f"{chat_id}: network error: {exc}")
-                continue
-
-            try:
-                self.raise_for_telegram_error(response)
-                delivered += 1
-            except RuntimeError as exc:
-                failures.append(f"{chat_id}: {exc}")
-
-        if failures:
-            raise RuntimeError("Telegram test failed for one or more recipients. " + " | ".join(failures))
-        return delivered
 
     def send_photo(self, image_path: Path, caption: str = "") -> int:
         """Send a photo alert to configured Telegram chat IDs."""
@@ -482,7 +473,7 @@ class SignalNotifier:
                         "document": (
                             document_path.name,
                             document_bytes,
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            "application/octet-stream",
                         )
                     },
                     timeout=60,
@@ -513,6 +504,11 @@ class SignalNotifier:
         if failures:
             print("Telegram delivery warning: " + " | ".join(failures))
         return delivered
+
+    def send_photo_as_document(self, event: SignalEvent, image_path: Path, caption: str = "") -> int:
+        # Use sendDocument as a fallback for Telegram image upload failures.
+        fallback_caption = caption + "\n\n(Image upload fallback as document)"
+        return self.send_document(image_path, fallback_caption)
 
     @staticmethod
     def raise_for_telegram_error(response: requests.Response) -> None:

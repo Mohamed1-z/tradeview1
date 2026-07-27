@@ -1,1 +1,1 @@
-"""Order block watchlist scanner package."""
+"""SWIFT watchlist scanner package."""

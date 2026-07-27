@@ -7,15 +7,16 @@ from swift_scanner.config import ScannerConfig
 from swift_scanner.indicator import (
     _detect_fvg_zones,
     _detect_liquidity_sweeps,
-    _detect_order_blocks,
     _detect_pattern_confirmation,
     _detect_premium_discount_zones,
     _entry_lines,
     _line_from_entry,
     _make_event,
+    _make_zone_trade_events,
     SwiftLines,
     scan_swift,
 )
+from swift_scanner.models import Zone
 
 
 def make_frame(rows):
@@ -67,6 +68,35 @@ def test_scans_swift_main_long_entry():
     assert reloaded.lesson == event.lesson
 
 
+def test_fresh_zone_becomes_named_trade_event():
+    data = make_frame(
+        [
+            ("2026-05-25 00:00:00+00:00", 10.0, 10.3, 9.7, 10.1, 1000),
+            ("2026-05-25 00:15:00+00:00", 10.1, 10.2, 9.8, 10.0, 1000),
+        ]
+    )
+    zone = Zone(
+        zone_type="liquidity_sweep",
+        direction="bullish",
+        symbol_request="TEST",
+        symbol_actual="TEST",
+        created_at=data.iloc[-1]["time"].to_pydatetime(),
+        left_index=0,
+        right_index=1,
+        top=10.2,
+        bottom=9.8,
+        formed_index=1,
+    )
+
+    events = _make_zone_trade_events(data, [zone], "TEST", "TEST", "M15", 1)
+
+    assert len(events) == 1
+    assert events[0].signal_source == "zone"
+    assert events[0].signal_label == "Zone Liquidity Sweep Entry"
+    assert events[0].signal_tags == ["liquidity_sweep"]
+    assert events[0].stop_loss < events[0].entry_price < events[0].take_profit_1
+
+
 def test_displacement_filter_blocks_weak_trigger_candle():
     data = make_frame(
         [
@@ -86,8 +116,8 @@ def test_displacement_filter_blocks_weak_trigger_candle():
 def test_displacement_filter_allows_strong_trigger_candle():
     data = make_frame(
         [
-            ("2026-05-25 00:00:00+00:00", 10.0, 10.0, 9.8, 9.8, 1000),
-            ("2026-05-25 00:15:00+00:00", 9.9, 10.3, 9.8, 10.25, 1000),
+            ("2026-05-25 00:00:00+00:00", 10.0, 10.2, 9.7, 9.8, 1000),
+            ("2026-05-25 00:15:00+00:00", 9.6, 10.4, 9.5, 10.1, 1000),
         ]
     )
     config = swift_test_config()
@@ -339,23 +369,6 @@ def test_scan_accepts_recent_events_for_alternate_signal_chunks():
 
     assert len(result.fresh_events) == 1
     assert result.fresh_events[0].zone.formed_index == 4
-
-
-def test_detect_order_blocks_identifies_reversal_order_block():
-    data = make_frame(
-        [
-            ("2026-05-25 00:00:00+00:00", 10.2, 10.5, 10.0, 10.1, 1000),
-            ("2026-05-25 00:15:00+00:00", 10.1, 10.7, 10.05, 10.6, 1000),
-        ]
-    )
-
-    zones = _detect_order_blocks(data, "TEST", "TEST")
-
-    assert len(zones) == 1
-    assert zones[0].zone_type == "order_block"
-    assert zones[0].direction == "bullish"
-    assert zones[0].top == pytest.approx(10.5)
-    assert zones[0].bottom == pytest.approx(10.0)
 
 
 def test_detect_fvg_zones_identifies_bullish_gap():

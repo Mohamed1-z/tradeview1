@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from swift_scanner.config import DEFAULT_TIMEFRAME_NAMES, ScannerConfig, TIMEFRAME_MAP, build_timeframes
@@ -81,6 +82,19 @@ from swift_scanner.notifier import SignalNotifier
 from swift_scanner.reporting import analyze_alert_history
 from swift_scanner.watcher import SwiftWatcher
 from swift_scanner.charting import generate_timeframe_example_image
+
+ZONE_TYPE_LABELS = {
+    "fair_value_gap": "Fair Value Gap",
+    "liquidity_sweep": "Liquidity Sweep",
+    "premium_zone": "Premium Zone",
+    "discount_zone": "Discount Zone",
+}
+ZONE_TYPE_DESCRIPTIONS = {
+    "fair_value_gap": "price imbalance / gap area",
+    "liquidity_sweep": "stop-hunt sweep and reversal area",
+    "premium_zone": "higher-price selling area",
+    "discount_zone": "lower-price buying area",
+}
 
 try:
     from dotenv import load_dotenv
@@ -134,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=DEFAULT_TIMEFRAME_NAMES,
         choices=sorted(TIMEFRAME_MAP),
-        help="Detection timeframes to scan. Defaults to M15.",
+        help="Detection timeframes to scan. Defaults to H4 H2 H1 M15.",
     )
     parser.add_argument(
         "--output-dir",
@@ -160,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-swift",
         action="store_true",
         help="Disable SWIFT detection so it can be enabled later without removing code.",
+    )
+    parser.add_argument(
+        "--disable-zones",
+        action="store_true",
+        help="Disable zone-trading signal detection while keeping SWIFT signals available.",
     )
     parser.add_argument(
         "--trend-filter",
@@ -232,10 +251,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable the session killzone timing filter so execution can be attempted outside the configured GMT windows.",
     )
     parser.add_argument(
+        "--bypass-execution-gates",
+        action="store_true",
+        help=(
+            "Allow execution after detection without optional gating checks "
+            "(zone gating, daily loss breaker, correlation cap, news blackout, profitability, and quality)."
+        ),
+    )
+    parser.add_argument(
+        "--no-startup-prompt",
+        action="store_true",
+        help="Skip the interactive startup choices and use CLI/default settings.",
+    )
+    parser.add_argument(
         "--order-volume",
         type=float,
         default=0.02,
         help="Order volume/lot size for live execution. Defaults to 0.02.",
+    )
+    parser.add_argument(
+        "--use-equity-based-sizing",
+        action="store_true",
+        help="Enable equity-based position sizing instead of fixed order volume.",
+    )
+    parser.add_argument(
+        "--risk-percent-per-trade",
+        type=float,
+        default=1.0,
+        help="Percent of equity to risk per trade when equity-based sizing is enabled. Defaults to 1.0.",
     )
     parser.add_argument(
         "--tp-target-level",
@@ -305,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate an Excel report from historical Telegram alert events and save it to the output directory.",
     )
     parser.add_argument(
+        "--require-fvg-for-premium",
+        action="store_true",
+        help="Require FVG confluence for premium zone entries (overrides default).",
+    )
+    parser.add_argument(
         "--report-lookahead-bars",
         type=int,
         default=40,
@@ -321,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
 def build_config_from_args(args) -> ScannerConfig:
     enable_swift = not args.disable_swift
 
-    return ScannerConfig(
+    config = ScannerConfig(
         bars_to_fetch=args.bars,
         chart_bars=args.chart_bars,
         scan_interval_seconds=args.interval,
@@ -332,6 +380,8 @@ def build_config_from_args(args) -> ScannerConfig:
         telegram_silent=args.telegram_silent,
         telegram_only=args.telegram_only,
         enable_swift=enable_swift,
+        enable_zone_trading=not args.disable_zones,
+        main_enabled=enable_swift,
         main_use_alternate_signals=not args.disable_alternate_signals,
         main_alternate_multiplier=args.main_alt_multiplier,
         main_basis_type=args.main_ma,
@@ -342,9 +392,12 @@ def build_config_from_args(args) -> ScannerConfig:
         dynamic_tp_atr_multiplier=args.dynamic_tp_atr_multiplier,
         enable_execution=not args.disable_execution,
         disable_killzone_filter=args.disable_killzone_filter,
+        bypass_execution_gates=args.bypass_execution_gates,
         entry_pip_buffer=args.entry_pip_buffer,
         tp_target_level=args.tp_target_level,
         order_volume=args.order_volume,
+        use_equity_based_sizing=args.use_equity_based_sizing,
+        risk_percent_per_trade=args.risk_percent_per_trade,
         order_magic_number=args.order_magic_number,
         order_deviation=args.order_deviation,
         max_confirmation_attempts=args.max_confirmation_attempts,
@@ -357,27 +410,225 @@ def build_config_from_args(args) -> ScannerConfig:
         use_trend_filter=args.trend_filter,
     )
 
+    # Optional CLI override: require FVG for premium zone
+    try:
+        if getattr(args, "require_fvg_for_premium", False):
+            if "premium_zone" in config.zone_gating:
+                config.zone_gating["premium_zone"].require_fvg_confluence = True
+    except Exception:
+        pass
+
+    return config
+
+
+def _ask_choice(prompt: str, choices: set[str], default: str) -> str:
+    choices_text = ", ".join(sorted(choices))
+    while True:
+        answer = input(f"{prompt}\nType one of: {choices_text}. Press Enter for {default}: ").strip().lower()
+        if not answer:
+            return default
+        if answer in choices:
+            return answer
+        print(f"I did not understand '{answer}'. Type one of: {choices_text}.")
+
+
+def _ask_timeframes(current_names: list[str]) -> list[str]:
+    supported = ", ".join(sorted(TIMEFRAME_MAP))
+    default_text = " ".join(current_names)
+    print("\n1) Choose chart timeframes to scan")
+    print(f"Available: {supported}")
+    print("Example: M15, or H1 M15, or press Enter to keep the default.")
+    while True:
+        raw = input(f"Timeframes to scan [default {default_text}]: ").strip()
+        if not raw:
+            return current_names
+        names = [part.strip().upper() for part in raw.replace(",", " ").split() if part.strip()]
+        invalid = [name for name in names if name not in TIMEFRAME_MAP]
+        if not names:
+            return current_names
+        if invalid:
+            print(f"Unsupported timeframe(s): {', '.join(invalid)}")
+            continue
+        return names
+
+
+def _format_zone_type(zone_type: str) -> str:
+    return ZONE_TYPE_LABELS.get(zone_type, zone_type.replace("_", " ").title())
+
+
+def _format_detector_summary(key: str) -> str:
+    if key == "swift":
+        return "SWIFT"
+    return _format_zone_type(key)
+
+
+def _ask_detectors(config: ScannerConfig) -> tuple[bool, list[str]]:
+    zone_types = list(getattr(config, "zone_gating", {}) or ZONE_TYPE_LABELS)
+    options = [("swift", "SWIFT")]
+    options.extend((zone_type, _format_zone_type(zone_type)) for zone_type in zone_types)
+
+    print("\n2) Choose what the program should detect")
+    print("Type the numbers you want, separated by spaces or commas.")
+    print("You can also type 'all' to scan everything, or 'none' to turn all detection off.")
+    for index, (key, label) in enumerate(options, start=1):
+        if key == "swift":
+            description = "main SWIFT buy/sell entry signals"
+        else:
+            description = ZONE_TYPE_DESCRIPTIONS.get(key, "zone setup")
+        print(f"  {index}. {label} - {description}")
+
+    default_tokens: list[str] = []
+    if config.enable_swift:
+        default_tokens.append("swift")
+    if config.enable_zone_trading:
+        default_tokens.extend(zone_types)
+    default_text = (
+        "all"
+        if len(default_tokens) == len(options)
+        else ", ".join(_format_detector_summary(token) for token in default_tokens) or "none"
+    )
+
+    aliases: dict[str, str] = {
+        "swift": "swift",
+        "swft": "swift",
+        "fvg": "fair_value_gap",
+        "fairvaluegap": "fair_value_gap",
+        "liquidity": "liquidity_sweep",
+        "sweep": "liquidity_sweep",
+        "liquiditysweep": "liquidity_sweep",
+        "premium": "premium_zone",
+        "premiumzone": "premium_zone",
+        "discount": "discount_zone",
+        "discountzone": "discount_zone",
+    }
+    for index, (key, label) in enumerate(options, start=1):
+        aliases[str(index)] = key
+        aliases[key.lower()] = key
+        aliases[key.replace("_", "").lower()] = key
+        aliases[label.lower().replace(" ", "")] = key
+
+    while True:
+        raw = input(
+            "Your detection choice "
+            f"[default {default_text}; examples: all, 1 2, 2 4, swift fvg, none]: "
+        ).strip()
+        if not raw:
+            selected = default_tokens
+        else:
+            normalized = raw.lower().replace(",", " ")
+            parts = [part.strip() for part in normalized.split() if part.strip()]
+            if any(part in {"all", "both"} for part in parts):
+                selected = [key for key, _ in options]
+            elif any(part in {"none", "no", "off"} for part in parts):
+                selected = []
+            else:
+                selected = []
+                unknown: list[str] = []
+                for part in parts:
+                    key = aliases.get(part) or aliases.get(part.replace("_", ""))
+                    if key is None:
+                        unknown.append(part)
+                        continue
+                    if key not in selected:
+                        selected.append(key)
+                if unknown:
+                    print(f"I did not understand: {', '.join(unknown)}. Use the numbers from the list, or type all/none.")
+                    continue
+
+        enable_swift = "swift" in selected
+        selected_zones = [key for key in selected if key != "swift"]
+        if not enable_swift and not selected_zones:
+            print("Nothing was selected. Choose at least SWIFT or one zone type so the scanner has something to detect.")
+            continue
+        return enable_swift, selected_zones
+
+
+def apply_startup_prompt(args, config: ScannerConfig) -> None:
+    if args.no_startup_prompt or args.test_telegram or args.send_sample_timeframe_image or args.export_alert_report:
+        return
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+
+    print("\nAlgo Swift startup setup")
+    current_timeframes = [timeframe.name for timeframe in config.timeframes]
+    config.timeframes = build_timeframes(_ask_timeframes(current_timeframes))
+
+    enable_swift, selected_zones = _ask_detectors(config)
+    config.enable_swift = enable_swift
+    config.main_enabled = config.enable_swift
+    config.selected_zone_types = selected_zones
+    config.enable_zone_trading = bool(selected_zones)
+
+    trade_choice = _ask_choice(
+        (
+            "\n3) After a selected signal is detected, should the program place live trades?\n"
+            "no = only alert/detect, no live order\n"
+            "gated = trade only after the normal safety/gating checks\n"
+            "bypass = trade after detection while skipping optional gates"
+        ),
+        {"no", "gated", "bypass"},
+        "gated" if config.enable_execution else "no",
+    )
+    config.enable_execution = trade_choice != "no"
+    config.bypass_execution_gates = trade_choice == "bypass"
+
+    killzone_choice = _ask_choice(
+        (
+            "\n4) Should trades be limited to configured killzone/session times?\n"
+            "yes = only trade during the configured GMT windows\n"
+            "no = allow trade attempts outside those windows too"
+        ),
+        {"yes", "no"},
+        "no" if config.disable_killzone_filter else "yes",
+    )
+    config.disable_killzone_filter = killzone_choice == "no"
+
+    gate_summary = "bypassing optional gates" if config.bypass_execution_gates else "using configured gates"
+    execution_summary = "off" if not config.enable_execution else gate_summary
+    print(
+        "\nStartup selection: "
+        f"timeframes={', '.join(tf.name for tf in config.timeframes)}, "
+        f"swift={'on' if config.enable_swift else 'off'}, "
+        f"zones={', '.join(_format_zone_type(zone) for zone in config.selected_zone_types) or 'off'}, "
+        f"execution={execution_summary}, "
+        f"killzone_filter={'off' if config.disable_killzone_filter else 'on'}"
+    )
+
+
+def _pause_before_exit() -> None:
+    if sys.stdin and sys.stdin.isatty():
+        try:
+            input("\nPress Enter to close this window...")
+        except EOFError:
+            pass
+
 
 def main() -> None:
     load_dotenv()
     args = build_parser().parse_args()
 
     config = build_config_from_args(args)
+    apply_startup_prompt(args, config)
     try:
         validate_config(config)
     except ValueError as exc:
         print(exc)
+        _pause_before_exit()
         raise SystemExit(1) from exc
 
     notifier = SignalNotifier(config)
 
     if args.test_telegram:
         try:
-            delivered = notifier.send_test_message()
+            notifier.validate_telegram()
+            delivered = notifier.send_text_alert("Telegram test message from Algo Swift.")
+            if delivered == 0:
+                raise RuntimeError("Telegram test message could not be delivered to any configured chats.")
             print(f"Telegram test message sent successfully to {delivered} chat(s).")
             return
         except RuntimeError as exc:
             print(exc)
+            _pause_before_exit()
             raise SystemExit(1) from exc
 
     if args.send_sample_timeframe_image:
@@ -393,6 +644,7 @@ def main() -> None:
             return
         except RuntimeError as exc:
             print(exc)
+            _pause_before_exit()
             raise SystemExit(1) from exc
 
     if args.export_alert_report:
@@ -415,6 +667,7 @@ def main() -> None:
             return
         except Exception as exc:
             print(exc)
+            _pause_before_exit()
             raise SystemExit(1) from exc
 
     watcher = SwiftWatcher(config)
@@ -428,6 +681,7 @@ def main() -> None:
         watcher.run(once=args.once)
     except RuntimeError as exc:
         print(exc)
+        _pause_before_exit()
         raise SystemExit(1) from exc
 
 

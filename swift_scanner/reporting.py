@@ -34,7 +34,6 @@ def infer_expected_direction(row: pd.Series) -> str:
     label = str(row.get("signal_label", "") or "").lower()
     signal_direction = str(
         row.get("signal_direction", "")
-        or row.get("order_block_direction", "")
         or row.get("zone_direction", "")
         or row.get("direction", "")
     ).lower()
@@ -58,7 +57,6 @@ def infer_signal_direction(row: pd.Series) -> str:
     label = str(row.get("signal_label", "") or "").lower()
     direction = str(
         row.get("signal_direction", "")
-        or row.get("order_block_direction", "")
         or row.get("zone_direction", "")
         or row.get("direction", "")
     ).lower()

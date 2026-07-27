@@ -1,0 +1,11 @@
+signals 67
+executions 34
+closures 13
+
+Zone summary
+{'zone_type': 'premium_zone', 'cnt': 7, 'wins': 7, 'avg_pnl': 0.4693, 'avg_pnl_r': None}
+{'zone_type': 'discount_zone', 'cnt': 6, 'wins': 6, 'avg_pnl': 0.0447, 'avg_pnl_r': None}
+
+Premium vs discount
+{'zone_type': 'discount_zone', 'cnt': 6, 'wins': 6, 'avg_pnl': 0.0447, 'avg_pnl_r': None}
+{'zone_type': 'premium_zone', 'cnt': 7, 'wins': 7, 'avg_pnl': 0.4693, 'avg_pnl_r': None}

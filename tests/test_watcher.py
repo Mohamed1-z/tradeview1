@@ -13,6 +13,7 @@ from dataclasses import replace
 from swift_scanner.config import ScannerConfig, SymbolScanConfig, TimeframeConfig, build_symbol_scan_configs
 from swift_scanner.models import ScanResult, SignalEvent, SignalDirection, Zone
 from swift_scanner.mt5_client import AutoTradingDisabledError
+from swift_scanner.trade_db import TradeDB
 from swift_scanner.watcher import PositionTracker, SwiftWatcher
 
 
@@ -104,10 +105,18 @@ def allow_profitable_gate(mock_mt5: Mock, event: SignalEvent) -> None:
             {"open": 1.0970, "high": 1.1030, "low": 1.0960, "close": 1.1020, "volume": 1},
         ]
 
+    h1_candles = h4_candles
+    h2_candles = h4_candles
+
     def recent_candles(symbol: str, timeframe_name: str, count: int = 5):
-        if timeframe_name.upper() == "H4":
+        normalized_tf = timeframe_name.upper()
+        if normalized_tf == "H4":
             return h4_candles[-count:]
-        if timeframe_name.upper() == "M15":
+        if normalized_tf == "H2":
+            return h2_candles[-count:]
+        if normalized_tf == "H1":
+            return h1_candles[-count:]
+        if normalized_tf == "M15":
             return m15_candles[-count:]
         return []
 
@@ -175,6 +184,36 @@ def test_management_self_talk_uses_reasoning_for_partial_close(tmp_path):
     assert any("runner" in reason.lower() for reason in reasons)
 
 
+def test_trade_reasoning_uses_swift_signal_context(tmp_path):
+    config = ScannerConfig(output_dir=tmp_path)
+    watcher = SwiftWatcher(config)
+    event = make_event("EURUSD", "M15", "bullish", "Main Long Entry")
+    event.signal_tags = ["fair_value_gap", "discount_zone"]
+    event.explanation = "price reclaimed the mean and the SWIFT crossover confirmed"
+
+    mt5 = Mock()
+    mt5.get_recent_candles.return_value = [
+        {"open": 1.0950, "high": 1.1000, "low": 1.0940, "close": 1.0980, "volume": 1},
+        {"open": 1.0980, "high": 1.1030, "low": 1.0970, "close": 1.1010, "volume": 1},
+        {"open": 1.1010, "high": 1.1060, "low": 1.1000, "close": 1.1040, "volume": 1},
+    ]
+
+    reasons = watcher._build_trade_reasoning(
+        event,
+        mt5,
+        market_tick(ask=1.1045, bid=1.1040),
+        0.00001,
+        82.0,
+        60.0,
+    )
+    reason_text = " ".join(reasons).lower()
+
+    assert "swift" in reason_text
+    assert "main long entry" in reason_text
+    assert "fair_value_gap" in reason_text
+    assert "discount_zone" in reason_text
+
+
 def test_trade_is_blocked_when_h2_bias_is_unknown_for_m15(tmp_path, capsys):
     config = ScannerConfig(output_dir=tmp_path)
     watcher = SwiftWatcher(config)
@@ -194,7 +233,7 @@ def test_trade_is_blocked_when_h2_bias_is_unknown_for_m15(tmp_path, capsys):
     captured = capsys.readouterr()
 
     assert result is False
-    assert "unable to determine H2 bias" in captured.out
+    assert "unable to determine H1 bias" in captured.out
 
 
 def test_trade_is_blocked_by_conflicting_h2_bias_for_all_symbols(tmp_path, capsys):
@@ -216,10 +255,27 @@ def test_trade_is_blocked_by_conflicting_h2_bias_for_all_symbols(tmp_path, capsy
     captured = capsys.readouterr()
 
     assert result is False
-    assert "[Gate] Blocked BTCUSD: H2 bias bearish conflicts with bullish trade" in captured.out
+    assert "[Gate] Blocked BTCUSD: H1 bias bearish conflicts with bullish trade" in captured.out
 
 
-def test_trade_is_blocked_by_conflicting_m30_bias_for_m5(tmp_path, capsys):
+def test_history_annotation_recommends_reduce_for_weak_pattern(tmp_path, capsys):
+    db_path = tmp_path / "trades.db"
+    db = TradeDB(db_path=db_path)
+    event = make_event("EURUSD", "M15", "bullish", "Main Long Entry")
+    event.zone.zone_type = "premium_zone"
+
+    for ticket, pnl in enumerate([0.02, -0.01, -0.02, -0.01, -0.01], start=1):
+        signal_id = db.record_signal(event)
+        db.record_execution(ticket, event, 0.10, signal_id=signal_id)
+        db.record_close(ticket, 1.10 + pnl, "TP_FINAL", pnl, None)
+
+    watcher = SwiftWatcher(ScannerConfig(output_dir=tmp_path))
+    watcher.trade_db = db
+    watcher._annotate_event_history(event)
+
+    assert "weak pattern" in event.lesson
+    assert "avoid or reducing" in event.lesson or "reducing size" in event.lesson
+    assert "premium_zone" in event.lesson or "pattern" in event.lesson
     config = ScannerConfig(output_dir=tmp_path)
     watcher = SwiftWatcher(config)
     event = make_event("EURUSD", "M5", "bearish", "Main Short Entry")
@@ -238,7 +294,7 @@ def test_trade_is_blocked_by_conflicting_m30_bias_for_m5(tmp_path, capsys):
     captured = capsys.readouterr()
 
     assert result is False
-    assert "[Gate] Blocked EURUSD: M30 bias bullish conflicts with bearish trade" in captured.out
+    assert "[Gate] Blocked EURUSD: H1 bias bullish conflicts with bearish trade" in captured.out
 
 
 def test_get_htf_bias_uses_recent_close_trend(tmp_path):
@@ -672,7 +728,7 @@ def test_build_runtime_config_uses_tightened_entry_buffers(
     [
         ("XAUUSD", "XAUUSDm", 2000.0, 0.01, 2, 0.55, 0.4284, 0.825, 1.32),
         ("BTCUSD", "BTCUSDm", 100000.0, 0.01, 2, 1.1, 0.778909, 1.5, 2.4),
-        ("USOIL", "WTIUSDm", 70.0, 0.001, 3, 0.1375, 0.231, 0.462, 0.792),
+        ("USOIL", "WTIUSDm", 70.0, 0.001, 3, 0.30, 0.21875, 0.4375, 0.75),
         ("NASDAQ", "USTEC_x100m", 20000.0, 0.1, 1, 88.0, 60.0, 120.0, 240.0),
         ("US30", "US30_x10m", 40000.0, 0.1, 1, 132.0, 99.0, 198.0, 316.8),
         ("GBPUSD", "GBPUSDm", 1.2500, 0.00001, 5, 0.0033, 0.00307125, 0.005265, 0.00702),
@@ -1110,6 +1166,82 @@ def test_retry_pending_execution_finishes_permanent_autotrading_failure(tmp_path
     watcher.notifier.notify.assert_called_once()
 
 
+def test_retry_pending_execution_increments_confirmation_attempts(tmp_path):
+    config = ScannerConfig(enable_execution=True, max_confirmation_attempts=3, output_dir=tmp_path)
+    watcher = SwiftWatcher(config)
+    event = make_event("EURUSD", "M15", "bullish", "Main Long Entry")
+    event.entry_price = 1.1000
+    event.price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit = 1.1200
+    event.take_profit_1 = 1.1200
+    event.take_profit_2 = 1.1300
+    event.take_profit_3 = 1.1400
+    event.signal_source = "swift"
+
+    mock_mt5 = Mock()
+    mock_mt5.has_open_position.return_value = False
+    mock_mt5.is_symbol_tradeable.return_value = True
+    mock_mt5.normalize_order_volume.return_value = 0.1
+    mock_mt5.get_symbol_market_status.return_value = {"point": 0.00001, "digits": 5}
+    mock_mt5.get_tick.return_value = market_tick(ask=1.1000, bid=1.1000)
+    mock_mt5.place_market_order.return_value = 12345
+    allow_profitable_gate(mock_mt5, event)
+
+    watcher.notifier = Mock()
+    with patch("swift_scanner.watcher.save_signal_chart", return_value=tmp_path / "chart.png"):
+        watcher.handle_event(Mock(fresh_events=[event]), event, mock_mt5)
+
+    assert event.event_id in watcher.pending_execution_events
+    initial_attempts = watcher.pending_confirmation_attempts.get(event.event_id, 0)
+
+    with patch("swift_scanner.watcher.save_signal_chart", return_value=tmp_path / "chart.png"):
+        watcher.retry_pending_executions(mock_mt5)
+
+    assert event.event_id in watcher.pending_execution_events
+    assert watcher.pending_confirmation_attempts[event.event_id] == initial_attempts + 1
+    mock_mt5.place_market_order.assert_not_called()
+
+
+def test_retry_pending_execution_succeeds_after_pending(tmp_path):
+    config = ScannerConfig(enable_execution=True, output_dir=tmp_path)
+    watcher = SwiftWatcher(config)
+    event = make_event("EURUSD", "M15", "bullish", "Main Long Entry")
+    event.entry_price = 1.1000
+    event.price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit = 1.1200
+    event.take_profit_1 = 1.1200
+    event.take_profit_2 = 1.1300
+    event.take_profit_3 = 1.1400
+    event.signal_source = "swift"
+
+    mock_mt5 = Mock()
+    mock_mt5.has_open_position.return_value = False
+    mock_mt5.is_symbol_tradeable.return_value = True
+    mock_mt5.normalize_order_volume.return_value = 0.1
+    mock_mt5.get_symbol_market_status.return_value = {"point": 0.00001, "digits": 5}
+    mock_mt5.get_tick.return_value = market_tick(ask=1.1000, bid=1.1000)
+    mock_mt5.place_market_order.return_value = 12345
+    allow_profitable_gate(mock_mt5, event)
+
+    watcher.notifier = Mock()
+    with patch("swift_scanner.watcher.save_signal_chart", return_value=Path("mock.png")):
+        watcher.handle_event(Mock(fresh_events=[event]), event, mock_mt5)
+
+    assert event.event_id in watcher.pending_execution_events
+    assert event.event_id not in watcher.sent_alert_ids
+
+    mock_mt5.get_tick.return_value = market_tick(ask=1.1006, bid=1.1005)
+    with patch("swift_scanner.watcher.save_signal_chart", return_value=Path("mock.png")):
+        watcher.retry_pending_executions(mock_mt5)
+
+    assert event.order_ticket == 12345
+    assert event.event_id not in watcher.pending_execution_events
+    assert event.event_id in watcher.sent_alert_ids
+    watcher.notifier.notify.assert_called_once()
+
+
 def test_execute_order_applies_raw_overrides_to_tp_and_sl(tmp_path):
     config = ScannerConfig(enable_execution=True, output_dir=tmp_path)
     watcher = SwiftWatcher(config)
@@ -1270,7 +1402,7 @@ def test_position_trackers_are_persisted_and_loaded(tmp_path):
         ("XAUUSD", "M5", 2000.0, 0.01, 2, 1992.3, 2005.9976, 2011.55, 2018.48),
         ("XAUUSD", "M15", 2000.0, 0.01, 2, 1989.0, 2008.568, 2016.5, 2026.4),
         ("BTCUSD", "M15", 100000.0, 0.01, 2, 99120.0, 100624.0, 101200.0, 101920.0),
-        ("USOIL", "M15", 70.0, 0.001, 3, 69.8625, 70.231, 70.462, 70.792),
+        ("USOIL", "M15", 70.0, 0.001, 3, 69.7, 70.21875, 70.4375, 70.75),
         ("NASDAQ", "M5", 20000.0, 0.1, 1, 19945.0, 20048.0, 20096.0, 20192.0),
         ("NASDAQ", "M15", 20000.0, 0.1, 1, 19967.0, 20042.0, 20084.0, 20168.0),
         ("US30", "M15", 40000.0, 0.1, 1, 39868.0, 40099.0, 40198.0, 40316.8),
@@ -1342,6 +1474,7 @@ def test_monitor_positions_closes_remaining_when_price_reverses_after_tp1(tmp_pa
         tp2_closed=False,
         tp3_closed=False,
         tp1_reversal_armed=True,
+        opposite_pending_closed=set(),
         get_remaining_volume=lambda: 0.07,
     )
     watcher.open_positions[123] = tracker
@@ -1354,7 +1487,11 @@ def test_monitor_positions_closes_remaining_when_price_reverses_after_tp1(tmp_pa
 
     # Add an opposite-direction pending entry for the same symbol
     opposite_event = make_event('EURUSD', 'M15', 'bearish', 'Main Short Entry')
-    watcher.pending_execution_events[opposite_event.event_id] = (opposite_event, None, None)
+    watcher.pending_execution_events[opposite_event.event_id] = (
+        opposite_event,
+        None,
+        Mock(spec=ScanResult),
+    )
 
     watcher._monitor_positions(mock_mt5)
 
@@ -1366,11 +1503,20 @@ def test_monitor_positions_closes_remaining_when_price_reverses_after_tp1(tmp_pa
         deviation=watcher.config.order_deviation,
         magic=watcher.config.order_magic_number,
     )
+    assert opposite_event.event_id in tracker.opposite_pending_closed
+    assert watcher.pending_execution_events[opposite_event.event_id][0] is opposite_event
 
 
 def test_cleanup_stale_opposite_pending_ids(tmp_path):
     config = ScannerConfig(output_dir=tmp_path)
     watcher = SwiftWatcher(config)
+
+    active_event = make_event('EURUSD', 'M15', 'bearish', 'Main Short Entry')
+    watcher.pending_execution_events[active_event.event_id] = (
+        active_event,
+        None,
+        Mock(spec=ScanResult),
+    )
 
     tracker = __import__('types').SimpleNamespace(
         ticket=123,
@@ -1389,7 +1535,7 @@ def test_cleanup_stale_opposite_pending_ids(tmp_path):
         tp2_closed=False,
         tp3_closed=False,
         tp1_reversal_armed=True,
-        opposite_pending_closed={"deadbeef"},
+        opposite_pending_closed={"deadbeef", active_event.event_id},
         get_remaining_volume=lambda: 0.07,
     )
     watcher.open_positions[123] = tracker
@@ -1399,23 +1545,20 @@ def test_cleanup_stale_opposite_pending_ids(tmp_path):
     mock_mt5.get_tick.return_value = market_tick(ask=1.0995, bid=1.0994)
     mock_mt5.get_symbol_market_status.return_value = {"point": 0.00001}
 
-    # Pending entry missing from the tracker should be cleaned up
-    watcher.pending_execution_events.clear()
-
     watcher._cleanup_stale_opposite_pending_ids()
 
-    assert getattr(tracker, "opposite_pending_closed", set()) == set()
+    assert getattr(tracker, "opposite_pending_closed", set()) == {active_event.event_id}
 
 
 def test_parent_bias_timeframe_mapping():
     config = ScannerConfig(output_dir=Path("."))
     watcher = SwiftWatcher(config)
 
-    assert watcher._parent_bias_timeframe("M5") == "M30"
-    assert watcher._parent_bias_timeframe("M15") == "H2"
-    assert watcher._parent_bias_timeframe("m15") == "H2"
-    assert watcher._parent_bias_timeframe("M30") is None
-    assert watcher._parent_bias_timeframe("H1") is None
+    assert watcher._parent_bias_timeframe("M5") == "H1"
+    assert watcher._parent_bias_timeframe("M15") == "H1"
+    assert watcher._parent_bias_timeframe("m15") == "H1"
+    assert watcher._parent_bias_timeframe("H1") == "H2"
+    assert watcher._parent_bias_timeframe("H2") == "H4"
     assert watcher._parent_bias_timeframe("H4") is None
     assert watcher._parent_bias_timeframe("D1") is None
 
@@ -1472,6 +1615,58 @@ def test_score_signal_quality_penalizes_late_entry(tmp_path):
     assert score < 60
 
 
+def test_delay_partial_close_when_momentum_is_strong(tmp_path):
+    config = ScannerConfig(output_dir=tmp_path)
+    config.partial_close_delay_on_strong_momentum = True
+    config.partial_close_momentum_candles = 4
+    config.partial_close_momentum_min_aligned_ratio = 0.75
+    watcher = SwiftWatcher(config)
+
+    tracker = make_tracker(123)
+    tracker.ticket = 123
+    tracker.symbol = "EURUSD"
+    tracker.timeframe = "M15"
+    tracker.direction = "bullish"
+    tracker.take_profit_1 = 1.1050
+    watcher.open_positions[tracker.ticket] = tracker
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = [
+        {"open": 1.1000, "high": 1.1030, "low": 1.0990, "close": 1.1010, "volume": 1},
+        {"open": 1.1010, "high": 1.1040, "low": 1.1000, "close": 1.1020, "volume": 1},
+        {"open": 1.1020, "high": 1.1050, "low": 1.1010, "close": 1.1030, "volume": 1},
+        {"open": 1.1030, "high": 1.1060, "low": 1.1020, "close": 1.1050, "volume": 1},
+    ]
+
+    assert watcher._should_delay_partial_close(tracker, mock_mt5, 1) is True
+
+
+def test_do_not_delay_partial_close_when_momentum_weak(tmp_path):
+    config = ScannerConfig(output_dir=tmp_path)
+    config.partial_close_delay_on_strong_momentum = True
+    config.partial_close_momentum_candles = 4
+    config.partial_close_momentum_min_aligned_ratio = 0.75
+    watcher = SwiftWatcher(config)
+
+    tracker = make_tracker(123)
+    tracker.ticket = 123
+    tracker.symbol = "EURUSD"
+    tracker.timeframe = "M15"
+    tracker.direction = "bullish"
+    tracker.take_profit_1 = 1.1050
+    watcher.open_positions[tracker.ticket] = tracker
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = [
+        {"open": 1.1000, "high": 1.1040, "low": 1.0990, "close": 1.1010, "volume": 1},
+        {"open": 1.1010, "high": 1.1020, "low": 1.1000, "close": 1.1005, "volume": 1},
+        {"open": 1.1005, "high": 1.1030, "low": 1.1000, "close": 1.1008, "volume": 1},
+        {"open": 1.1008, "high": 1.1060, "low": 1.1005, "close": 1.1010, "volume": 1},
+    ]
+
+    assert watcher._should_delay_partial_close(tracker, mock_mt5, 1) is False
+
+
 def test_score_signal_quality_defaults_to_50_on_data_errors(tmp_path):
     """Test that scoring gracefully handles MT5 data failures."""
     config = ScannerConfig(output_dir=tmp_path)
@@ -1491,6 +1686,117 @@ def test_score_signal_quality_defaults_to_50_on_data_errors(tmp_path):
     # Should still return a valid score (base 35 minimum)
     assert 0 <= score <= 100
     assert score >= 35  # At minimum, base score
+
+
+def test_fvg_zone_increases_score(tmp_path):
+    """Fair value gap zone should increase signal quality as a confluence boost."""
+    config = ScannerConfig(output_dir=tmp_path)
+    watcher = SwiftWatcher(config)
+
+    event = make_event("EURUSD", "M15", "bullish", "FVG Long Entry")
+    event.entry_price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit_1 = 1.1050
+    # mark the zone as a fair value gap
+    event.zone.zone_type = "fair_value_gap"
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = []
+    tick = market_tick(ask=1.1005, bid=1.1004)
+
+    score = watcher._score_signal_quality(event, mock_mt5, tick, 0.0001)
+
+    # Base 35 + FVG bonus (8) should lift the score above baseline
+    assert score >= 40
+
+
+def test_fvg_confluence_boosts_premium_zone(tmp_path):
+    """When a premium/discount zone also has an FVG confluence flag, it should boost score further."""
+    config = ScannerConfig(output_dir=tmp_path)
+    watcher = SwiftWatcher(config)
+
+    event = make_event("EURUSD", "M15", "bullish", "Premium+FVG Entry")
+    event.entry_price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit_1 = 1.1050
+    event.zone.zone_type = "premium_zone"
+    event.zone.metadata["fvg_confluence"] = True
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = []
+    tick = market_tick(ask=1.1005, bid=1.1004)
+
+    score = watcher._score_signal_quality(event, mock_mt5, tick, 0.0001)
+
+    assert score >= 42
+
+
+def test_zone_fairness_rebalances_premium_and_discount_scores(tmp_path):
+    """A dominant zone should get a small fairness penalty when the opposite zone has lagged behind."""
+    def make_watcher(enable_fairness: bool) -> SwiftWatcher:
+        config = ScannerConfig(
+            output_dir=tmp_path,
+            zone_fairness_enabled=enable_fairness,
+            zone_fairness_boost=3.0,
+            zone_fairness_min_trades=5,
+            zone_fairness_min_win_rate_gap=15.0,
+        )
+        return SwiftWatcher(config)
+
+    def fake_get_pattern_stats(symbol, timeframe, direction, zone_type):
+        if zone_type == "premium_zone":
+            return {"total_closed": 6, "wins": 6, "win_rate_pct": 100.0, "total_pnl": 1.25}
+        if zone_type == "discount_zone":
+            return {"total_closed": 6, "wins": 1, "win_rate_pct": 16.7, "total_pnl": -0.4}
+        return {"total_closed": 0, "wins": 0, "win_rate_pct": 0.0, "total_pnl": 0.0}
+
+    fair_watcher = make_watcher(enable_fairness=True)
+    fair_watcher.trade_db.get_pattern_stats = Mock(side_effect=fake_get_pattern_stats)
+
+    basic_watcher = make_watcher(enable_fairness=False)
+    basic_watcher.trade_db.get_pattern_stats = Mock(side_effect=fake_get_pattern_stats)
+
+    event = make_event("EURUSD", "M15", "bullish", "Premium fairness check")
+    event.entry_price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit_1 = 1.1050
+    event.zone.zone_type = "premium_zone"
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = []
+    tick = market_tick(ask=1.1005, bid=1.1004)
+
+    fair_score = fair_watcher._score_signal_quality(event, mock_mt5, tick, 0.0001)
+    basic_score = basic_watcher._score_signal_quality(event, mock_mt5, tick, 0.0001)
+
+    assert fair_score < basic_score
+
+
+def test_fvg_bonus_is_configurable(tmp_path):
+    config = ScannerConfig(output_dir=tmp_path)
+    config.zone_gating["fair_value_gap"] = config.zone_gating["fair_value_gap"].__class__(
+        entry_timeframes=("M15",),
+        require_htf_bias=True,
+        max_freshness_closes=3,
+        allow_opposite_entry=False,
+        min_signal_quality_score=30,
+        fvg_bonus=15.0,
+    )
+    watcher = SwiftWatcher(config)
+
+    event = make_event("EURUSD", "M15", "bullish", "FVG Big Bonus")
+    event.entry_price = 1.1000
+    event.stop_loss = 1.0950
+    event.take_profit_1 = 1.1050
+    event.zone.zone_type = "fair_value_gap"
+
+    mock_mt5 = Mock()
+    mock_mt5.get_recent_candles.return_value = []
+    tick = market_tick(ask=1.1005, bid=1.1004)
+
+    score = watcher._score_signal_quality(event, mock_mt5, tick, 0.0001)
+
+    assert score >= 50
 
 
 def test_signal_event_decision_fields_round_trip(tmp_path):
